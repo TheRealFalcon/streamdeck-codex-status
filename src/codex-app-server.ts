@@ -1,7 +1,7 @@
 import { ChildProcess, spawn } from "node:child_process";
 import { basename, delimiter, join } from "node:path";
 
-const POLL_INTERVAL_MS = 1_500;
+const POLL_INTERVAL_MS = 30_000;
 const RECONNECT_DELAY_MS = 5_000;
 const REQUEST_TIMEOUT_MS = 10_000;
 const PAGE_SIZE = 200;
@@ -30,8 +30,8 @@ type AppServerThread = {
 	};
 };
 
-type ThreadListResult = {
-	data: AppServerThread[];
+type LoadedThreadListResult = {
+	data: string[];
 	nextCursor: string | null;
 };
 
@@ -54,8 +54,8 @@ type PendingRequest = {
  *
  * The protocol is bidirectional JSON-RPC over a localhost WebSocket. Keeping
  * the connection open lets us consume `thread/status/changed` notifications
- * immediately while a small poll also discovers sessions made in other Codex
- * surfaces connected to this same server.
+ * immediately. A slower loaded-thread snapshot recovers missed events without
+ * scanning historical sessions. Thread metadata is cached between snapshots.
  */
 export class CodexAppServer {
 	private readonly serverUrl = process.env.CODEX_APP_SERVER_URL || "ws://127.0.0.1:45999";
@@ -68,6 +68,8 @@ export class CodexAppServer {
 	private pollTimer: NodeJS.Timeout | undefined;
 	private reconnectTimer: NodeJS.Timeout | undefined;
 	private threads = new Map<string, AppServerThread>();
+	private snapshotChanges: Map<string, Partial<AppServerThread>> | undefined;
+	private refreshAgain = false;
 	public sessions: CodexSession[] = [];
 	public onSessionsChanged: (() => void) | undefined;
 
@@ -104,6 +106,7 @@ export class CodexAppServer {
 	}
 
 	private async initialize(): Promise<void> {
+		const socket = this.socket;
 		try {
 			await this.request("initialize", {
 				clientInfo: {
@@ -113,13 +116,14 @@ export class CodexAppServer {
 				},
 				capabilities: { experimentalApi: true },
 			});
+			if (this.socket !== socket) return;
 			this.notify("initialized", {});
 			this.isReady = true;
 			this.refresh();
 			this.pollTimer = setInterval(() => this.refresh(), POLL_INTERVAL_MS);
 		} catch {
-			if (this.socket) {
-				this.socket.close();
+			if (this.socket === socket) {
+				socket?.close();
 			}
 		}
 	}
@@ -136,6 +140,7 @@ export class CodexAppServer {
 			}
 		});
 		socket.addEventListener("message", (event) => {
+			if (this.socket !== socket) return;
 			try {
 				this.handleMessage(JSON.parse(String(event.data)) as RpcMessage);
 			} catch {
@@ -147,29 +152,53 @@ export class CodexAppServer {
 	}
 
 	private async refreshThreads(): Promise<void> {
+		const socket = this.socket;
 		this.isRefreshing = true;
+		const changes = new Map<string, Partial<AppServerThread>>();
+		this.snapshotChanges = changes;
 		try {
-			const threads: AppServerThread[] = [];
+			const threads = new Map<string, AppServerThread>();
 			let cursor: string | null = null;
+			const seenCursors = new Set<string>();
 			do {
-				const result = await this.request("thread/list", {
+				const result = await this.request("thread/loaded/list", {
 					cursor,
 					limit: PAGE_SIZE,
-					sortKey: "updated_at",
-					sortDirection: "desc",
-				}) as ThreadListResult;
-				threads.push(...result.data);
+				}) as LoadedThreadListResult;
+				if (this.socket !== socket) return;
+				for (const id of result.data) {
+					const { thread } = await this.request("thread/read", {
+						threadId: id,
+						includeTurns: false,
+					}) as { thread: AppServerThread };
+					if (this.socket !== socket) return;
+					threads.set(id, thread);
+				}
 				cursor = result.nextCursor;
-			} while (cursor && threads.length < 1_000);
+				if (cursor && seenCursors.has(cursor)) throw new Error("Repeated pagination cursor");
+				if (cursor) seenCursors.add(cursor);
+			} while (cursor);
 
-			this.threads = new Map(threads.map((thread) => [thread.id, thread]));
+			// Notifications received during a snapshot take precedence over reads.
+			for (const [id, change] of changes) {
+				const thread = threads.get(id) ?? this.threads.get(id);
+				if (thread) threads.set(id, { ...thread, ...change });
+			}
+			this.threads = threads;
 			this.updateSessions();
 		} catch {
-			if (this.socket) {
-				this.socket.close();
+			if (this.socket === socket) {
+				socket?.close();
 			}
 		} finally {
-			this.isRefreshing = false;
+			if (this.socket === socket) {
+				this.snapshotChanges = undefined;
+				this.isRefreshing = false;
+				if (this.refreshAgain) {
+					this.refreshAgain = false;
+					this.refresh();
+				}
+			}
 		}
 	}
 
@@ -212,6 +241,7 @@ export class CodexAppServer {
 	}
 
 	private handleMessage(message: RpcMessage): void {
+		if (message.id !== undefined && message.method) return;
 		if (typeof message.id === "number") {
 			const pending = this.pending.get(message.id);
 			if (!pending) {
@@ -227,13 +257,29 @@ export class CodexAppServer {
 			return;
 		}
 
-		if (message.method === "thread/status/changed") {
-			const params = message.params as { threadId?: string; status?: AppServerThread["status"] };
-			const thread = params.threadId ? this.threads.get(params.threadId) : undefined;
-			if (thread && params.status) {
-				thread.status = params.status;
-				this.updateSessions();
-			}
+		if (message.method === "thread/started") {
+			const { thread } = message.params as { thread: AppServerThread };
+			this.threads.set(thread.id, thread);
+			this.snapshotChanges?.set(thread.id, thread);
+			this.updateSessions();
+			return;
+		}
+		const params = message.params as { threadId?: string; status?: AppServerThread["status"] } | undefined;
+		if (!params?.threadId) return;
+		const status = message.method === "thread/status/changed" ? params.status
+			: ["thread/closed", "thread/archived", "thread/deleted"].includes(message.method ?? "")
+				? { type: "notLoaded" as const } : undefined;
+		if (!status) return;
+		const change = { status, recencyAt: Date.now() / 1_000 };
+		this.snapshotChanges?.set(params.threadId, { ...this.snapshotChanges.get(params.threadId), ...change });
+		const thread = this.threads.get(params.threadId);
+		if (thread) {
+			Object.assign(thread, change);
+			this.updateSessions();
+		} else if (status.type !== "notLoaded") {
+			// Fetch metadata once when a notification reveals an unknown session.
+			if (this.isRefreshing) this.refreshAgain = true;
+			else this.refresh();
 		}
 	}
 
@@ -277,6 +323,8 @@ export class CodexAppServer {
 	private resetConnection(): void {
 		this.isReady = false;
 		this.isRefreshing = false;
+		this.snapshotChanges = undefined;
+		this.refreshAgain = false;
 		if (this.pollTimer) {
 			clearInterval(this.pollTimer);
 			this.pollTimer = undefined;

@@ -30,6 +30,12 @@ marks separately started CLI sessions as `notLoaded`, so the plugin excludes
 them rather than showing an incorrect state. `WAIT` covers both approvals and
 interactive user-input requests.
 
+The plugin caches loaded-thread metadata and applies status and lifecycle
+notifications immediately. Every 30 seconds it reconciles using
+`thread/loaded/list` and `thread/read` without turns, so missed events recover
+without repeatedly scanning historical sessions. With no loaded sessions, each
+reconciliation needs only one request. A key press also requests a refresh.
+
 To use an app-server you manage yourself, launch it separately and set the
 Stream Deck plugin process environment variable `CODEX_APP_SERVER_URL` to its
 localhost WebSocket URL. This does not add a Stream Deck configuration option.
@@ -38,6 +44,7 @@ localhost WebSocket URL. This does not add a Stream Deck configuration option.
 
 ```sh
 npm run build
+node --test tests/*.test.mjs
 streamdeck link com.falcon.falcon
 streamdeck restart com.falcon.falcon
 ```
