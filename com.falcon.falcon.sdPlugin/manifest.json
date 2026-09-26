@@ -1,0 +1,47 @@
+{
+	"Name": "Codex Status",
+	"Version": "0.1.0.0",
+	"Author": "Falcon",
+	"Actions": [
+		{
+			"Name": "Codex Session Status",
+			"UUID": "com.falcon.falcon.codex-status",
+			"Icon": "imgs/actions/counter/icon",
+			"Tooltip": "Displays the status of a recent Codex session.",
+			"PropertyInspectorPath": "ui/codex-status.html",
+			"Controllers": [
+				"Keypad"
+			],
+			"States": [
+				{
+					"Image": "imgs/actions/counter/key",
+					"TitleAlignment": "middle"
+				}
+			]
+		}
+	],
+	"Category": "Codex Status",
+	"CategoryIcon": "imgs/plugin/category-icon",
+	"CodePath": "bin/plugin.js",
+	"Description": "Display codex status",
+	"Icon": "imgs/plugin/marketplace",
+	"SDKVersion": 3,
+	"Software": {
+		"MinimumVersion": "7.1"
+	},
+	"OS": [
+		{
+			"Platform": "mac",
+			"MinimumVersion": "12"
+		},
+		{
+			"Platform": "windows",
+			"MinimumVersion": "10"
+		}
+	],
+	"Nodejs": {
+		"Version": "24",
+		"Debug": "enabled"
+	},
+	"UUID": "com.falcon.falcon"
+}
